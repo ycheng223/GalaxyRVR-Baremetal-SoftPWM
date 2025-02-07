@@ -10,38 +10,147 @@ variable (_isr_count) attached to Timer2 reaches a certain value (current_pwm), 
 #include <avr/interrupt.h>
 #include <Arduino.h>
 
-/* Pin definitions */
-#define FORWARD_RIGHT PD2
-#define REVERSE_RIGHT PD3
-#define REVERSE_LEFT PD4
-#define FORWARD_LEFT PD5
+/* Main Revisions for 1.1d */
 
-/* Motor control definitions */
-#define FORWARD 1
-#define REVERSE 2
-#define LEFT 3
-#define RIGHT 4
-#define BRAKE 5
+/* We will change most of the definitions and macros from the previous version into constant expressions (constexpr) to 
+improve encapsulation and speed. These constants will then be evaluated at compile and inserted directly into the assembly
+code. This will result in a longer compile time but (hopefully) a faster program. */
 
-/* PWM settings */
-#define MOTOR_POWER_MIN (uint8_t) 55
-#define MOTOR_POWER_MAX (uint8_t) 255
-#define FADE_STEP 20
+/* Instead of using case switch to control the direction of the motors, we will have the compiler recursively instantiate
+variations of a template (i.e. template metaprogramming) to obtain all motor directions. This should also speed up the code
+at the expense of file size. */
 
-extern volatile uint8_t _isr_count;
-extern volatile uint8_t _target_pwm;
-extern volatile uint8_t _is_fading;
-extern volatile uint8_t current_pwm;
+/* We will inline as many functions as possible using using inline, this forces the compiler to inline the 
+associated function regardless of optimization flags, again trade-off between speed and file size.*/
 
-class Rover_PWM{
-    public:
-    void Motor_PWM_Init(void);
+/* To preserve encapsulation while giving ISR access to private members, we need to create a friend ISR wrapper. 
+We need to use a wrapper because friend declarations cannot include function attributes. The ISR macro in AVR-GCC however, 
+is expanded (in preprocessing) to a function with two attributes (signal, used) and so would cause invalid syntax to be 
+generated when combined with a friend declaration. Hence we will declare a wrapper as a friend that can call the private members 
+in Rover_PWM while being invoked by the ISR. */
+
+inline void Timer2_COMPA_ISR();
+
+class Rover_PWM {
+public:
+
+    //Access function that main will use to create the static instance pointer and instantiate a Rover_PWM class object
+    static Rover_PWM* getInstance();
+
+    // Motor Direction and Control definitions
+    static constexpr uint8_t FORWARD = 1;
+    static constexpr uint8_t REVERSE = 2;
+    static constexpr uint8_t LEFT = 3;
+    static constexpr uint8_t RIGHT = 4;
+    static constexpr uint8_t BRAKE = 5;
+    volatile uint8_t current_pwm = 0;
+
+    // Initialization and input functions
+    void Motor_PWM_Init();
     void Change_Speed(uint8_t target);
-    void Motor_Direction(uint8_t direction, uint8_t pwm_value);
+    void SetDirection(uint8_t direction);
 
-    private:
-    uint8_t _is_fading_in_progress(void);
+private:
+    // Private constructor to enforce singleton (i.e. single instance)
+    Rover_PWM();
+
+    // Pin definitions
+    static constexpr uint8_t _FORWARD_RIGHT = PD2;
+    static constexpr uint8_t _REVERSE_RIGHT = PD3;
+    static constexpr uint8_t _REVERSE_LEFT = PD4;
+    static constexpr uint8_t _FORWARD_LEFT = PD5;
+
+    // PWM Settings
+    static constexpr uint8_t _MOTOR_POWER_MIN = 55;
+    static constexpr uint8_t _MOTOR_POWER_MAX = 255;
+    static constexpr uint8_t _FADE_STEP = 20;
+
+    // Instance and initialization variables
+    static Rover_PWM* rover_instance;
+    volatile uint8_t _isr_count = 0xff;
+    volatile uint8_t _target_pwm = 64;
+    volatile uint8_t _is_fading = 0;
+
+    // Grant access to the ISR wrapper
+    friend void Timer2_COMPA_ISR();
+
+    // Motor Direction templates -> Recursive template to check all directions
+    template <uint8_t Direction>
+    inline void MotorDirectionHandler(uint8_t direction);
+
+    // Contol templates -> invoked by motor direction template to set motor pins
+    template <uint8_t Direction>
+    inline void applyDirection();
+
+    //Inline PWM Control functions (must be defined in header or will cause warning)
+    inline void TimerInterruptHandler() {
+        ++_isr_count;
+        if (_is_fading) {
+            if (current_pwm < _target_pwm) {
+                current_pwm = min(current_pwm + _FADE_STEP, _target_pwm);
+                current_pwm = min(current_pwm, _MOTOR_POWER_MAX);
+                if (current_pwm == _target_pwm) _is_fading = 0;
+            } 
+            else if (current_pwm > _target_pwm) {
+                current_pwm = max(current_pwm - _FADE_STEP, _target_pwm);
+                current_pwm = max(current_pwm, _MOTOR_POWER_MIN);
+                if (current_pwm == _target_pwm) _is_fading = 0;
+            } 
+            else {
+                _is_fading = 0;
+            }
+        }
+    }
+
+    inline void updateMotorPins(uint8_t pins) {
+        /* Function for performing atomic updates on motor pins. Interrupts are disabled to ensure atomicity. */
+        cli(); // disable global interrupts
+        PORTD = ( PORTD & ~((1 << _FORWARD_RIGHT) | (1 << _REVERSE_RIGHT) | (1 << _FORWARD_LEFT) | (1 << _REVERSE_LEFT)) ) | pins;
+        sei(); // re-enable global interrupts
+    }
+
 };
 
+// Direction function to recursivelly call the motor direction template spcializations until one matches the input direction
+
+template <uint8_t Dir>
+inline void Rover_PWM::MotorDirectionHandler(uint8_t direction) {
+    if (Dir == direction) {
+        applyDirection<Dir>();
+    } else {
+        MotorDirectionHandler<Dir + 1>(direction);
+    }
+}
+
+// Template specializations need to be inlined to prevent multiple definitions error:
+template <>
+inline void Rover_PWM::MotorDirectionHandler<Rover_PWM::BRAKE + 1>(uint8_t) {}
+
+// Inline specializations for applyDirection:
+template <>
+inline void Rover_PWM::applyDirection<Rover_PWM::FORWARD>() {
+    updateMotorPins((1 << _FORWARD_RIGHT) | (1 << _FORWARD_LEFT));
+}
+
+template <>
+inline void Rover_PWM::applyDirection<Rover_PWM::REVERSE>() {
+    updateMotorPins((1 << _REVERSE_RIGHT) | (1 << _REVERSE_LEFT));
+}
+
+template <>
+inline void Rover_PWM::applyDirection<Rover_PWM::LEFT>() {
+    updateMotorPins((1 << _FORWARD_RIGHT) | (1 << _REVERSE_LEFT));
+}
+
+template <>
+inline void Rover_PWM::applyDirection<Rover_PWM::RIGHT>() {
+    updateMotorPins((1 << _REVERSE_RIGHT) | (1 << _FORWARD_LEFT));
+}
+
+template <>
+inline void Rover_PWM::applyDirection<Rover_PWM::BRAKE>() {
+    updateMotorPins((1 << _FORWARD_RIGHT) | (1 << _REVERSE_RIGHT) |
+                    (1 << _FORWARD_LEFT) | (1 << _REVERSE_LEFT));
+}
 
 #endif
